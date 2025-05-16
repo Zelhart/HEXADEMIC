@@ -1,0 +1,724 @@
+using UnityEngine;
+using System.Diagnostics;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Linq;
+using Unity.Collections;
+using Unity.Jobs;
+using System.Threading.Tasks; 
+
+public class HexademicVisualizer : MonoBehaviour
+{
+    // Lattice constants - making these static readonly for better performance
+    private static readonly int LATTICE_DIM = 16;
+    private static readonly int LATTICE_SIZE = LATTICE_DIM * LATTICE_DIM * LATTICE_DIM * LATTICE_DIM;
+    private static readonly int THREAD_GROUP_SIZE = 8;
+    
+    // Core compute resources
+    public ComputeShader visionCS, interoCS, emotionCS, memoryCS, sliceExtractCS;
+    [HideInInspector] public ComputeBuffer latticeBufferRead, latticeBufferWrite;
+    [HideInInspector] public ComputeBuffer histogramBuffer; // For histogram computation
+    
+    // Native memory structure for CPU-side operations (more efficient than separate arrays)
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LatticeVoxel
+    {
+        public ushort packedValue; // Bits: [15-12]=Memory, [11-8]=Emotion, [7-4]=Intero, [3-0]=Vision
+    }
+    private NativeArray<LatticeVoxel> nativeLatticeData;
+    
+    // Visualization textures (one per hemisphere + combined)
+    [HideInInspector] public RenderTexture[] hemisphereSlices = new RenderTexture[4]; // H0-H3
+    [HideInInspector] public RenderTexture combinedSlice;
+    
+    // Slice navigation
+    [Range(0,15)] public int xSlice, ySlice, zSlice, wSlice;
+    public enum SliceMode { XY, XZ, YZ, XW, YW, ZW }
+    public SliceMode currentSliceMode = SliceMode.XY;
+    
+    // Visualization settings
+    [Range(0,1)] public float[] hemisphereWeights = new float[4] {1, 0, 0, 0};
+    
+    // Color schemes - allowing for different color mapping strategies
+    public enum ColorScheme { Standard, Heatmap, Spectrum, Monochrome }
+    public ColorScheme colorScheme = ColorScheme.Standard;
+    
+    // Color palettes for the different schemes
+    public Color[] standardColors = new Color[4] {
+        new Color(1.0f, 0.2f, 0.2f), // H0 - Vision (stronger red)
+        new Color(0.2f, 0.9f, 0.3f), // H1 - Interoception (stronger green)
+        new Color(0.2f, 0.4f, 1.0f), // H2 - Emotion (stronger blue)
+        new Color(1.0f, 0.9f, 0.2f)  // H3 - Memory (stronger yellow)
+    };
+    
+    // Performance metrics
+    private Stopwatch[] dispatchTimers = new Stopwatch[4];
+    private float[] lastFrameTimes = new float[4];
+    [HideInInspector] public Queue<float>[] historicalFrameTimes;
+    private int historyLength = 120; // 2 seconds at 60fps for more data history
+    
+    // Optimization settings
+    [Header("Optimization Settings")]
+    public bool useAsyncReadback = true;
+    public bool useNativeJobs = true;
+    public int simulationUpdateRate = 1; // Run every N frames
+    private int frameCounter = 0;
+    
+    // Processing flags
+    private bool isHistogramDirty = true;
+    private bool isSliceDirty = true;
+    
+    // Animation properties
+    [HideInInspector] public bool isAnimating = false;
+    [HideInInspector] public int animationAxis = 3; // Default to W-axis
+    public float animationSpeed = 5.0f;
+    private float animationTime = 0;
+    
+    // Event that fires whenever lattice data changes significantly
+    public delegate void LatticeChangedHandler();
+    public event LatticeChangedHandler OnLatticeChanged;
+    
+    // Additional tools and features
+    [Header("Advanced Features")]
+    public bool enableStateInterpolation = false;
+    public bool enableSpatialFiltering = false;
+    [Range(0.0f, 1.0f)] public float stateSmoothingFactor = 0.1f;
+    [Range(0, 3)] public int spatialFilterRadius = 1;
+    
+    // Debug options
+    [Header("Debug")]
+    public bool showDebugInfo = false;
+    public bool logPerformanceStats = false;
+    public bool simulateCpuOverhead = false;
+    [Range(0, 20)] public int artificialOverheadMs = 0;
+    
+    void Start()
+    {
+        Initialize();
+    }
+    
+    public void Initialize()
+    {
+        // Clean up any existing resources before reinitializing
+        CleanupResources();
+        
+        // Initialize historical frame time tracking
+        historicalFrameTimes = new Queue<float>[4];
+        for (int i = 0; i < 4; i++)
+        {
+            dispatchTimers[i] = new Stopwatch();
+            historicalFrameTimes[i] = new Queue<float>(historyLength);
+            for (int j = 0; j < historyLength; j++)
+                historicalFrameTimes[i].Enqueue(0);
+        }
+        
+        // Initialize compute buffers
+        latticeBufferRead = new ComputeBuffer(LATTICE_SIZE, sizeof(ushort));
+        latticeBufferWrite = new ComputeBuffer(LATTICE_SIZE, sizeof(ushort));
+        histogramBuffer = new ComputeBuffer(16, sizeof(uint)); // 16 values for histogram, one for each possible value 0-15
+        
+        // Create and initialize native lattice array using Unity's native containers for better performance
+        nativeLatticeData = new NativeArray<LatticeVoxel>(LATTICE_SIZE, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+        for (int i = 0; i < LATTICE_SIZE; i++)
+        {
+            nativeLatticeData[i] = new LatticeVoxel { packedValue = 0 }; // Initialize empty
+        }
+        
+        // Upload initial data to GPU
+        latticeBufferRead.SetData(nativeLatticeData.Select(v => v.packedValue).ToArray());
+        latticeBufferWrite.SetData(nativeLatticeData.Select(v => v.packedValue).ToArray());
+        
+        // Initialize render textures
+        for (int i = 0; i < 4; i++)
+        {
+            hemisphereSlices[i] = new RenderTexture(LATTICE_DIM, LATTICE_DIM, 0, RenderTextureFormat.R16);
+            hemisphereSlices[i].enableRandomWrite = true;
+            hemisphereSlices[i].Create();
+        }
+        
+        combinedSlice = new RenderTexture(LATTICE_DIM, LATTICE_DIM, 0, RenderTextureFormat.ARGB32);
+        combinedSlice.enableRandomWrite = true;
+        combinedSlice.Create();
+        
+        // Initial slice extraction to show something on startup
+        ExtractSlices();
+        CombineSlices();
+    }
+    
+    void Update()
+    {
+        // Handle animation if active
+        if (isAnimating)
+        {
+            animationTime += Time.deltaTime;
+            
+            // Improved animation - use smooth interpolation instead of floor
+            float animValue = Mathf.PingPong(animationTime * animationSpeed, 15);
+            
+            switch(animationAxis)
+            {
+                case 0: xSlice = Mathf.RoundToInt(animValue); break;
+                case 1: ySlice = Mathf.RoundToInt(animValue); break;
+                case 2: zSlice = Mathf.RoundToInt(animValue); break;
+                case 3: wSlice = Mathf.RoundToInt(animValue); break;
+            }
+            
+            isSliceDirty = true;
+        }
+        
+        // Simulate CPU overhead if debugging performance impact
+        if (simulateCpuOverhead && artificialOverheadMs > 0)
+        {
+            System.Threading.Thread.Sleep(artificialOverheadMs);
+        }
+        
+        // Use frame counter to update less frequently for better performance
+        frameCounter++;
+        if (frameCounter >= simulationUpdateRate)
+        {
+            frameCounter = 0;
+            
+            // Ping-pong buffer approach - after all dispatches, swap read/write
+            if (ShouldRunSimulation())
+            {
+                RunHemisphereDispatch(0, visionCS, "CS_VisionHemisphere");
+                RunHemisphereDispatch(1, interoCS, "CS_InteroHemisphere");
+                RunHemisphereDispatch(2, emotionCS, "CS_EmotionHemisphere");
+                RunHemisphereDispatch(3, memoryCS, "CS_MemoryHemisphere");
+                
+                // Apply spatial filtering if enabled
+                if (enableSpatialFiltering && spatialFilterRadius > 0)
+                {
+                    ApplySpatialFiltering();
+                }
+                
+                // Apply state interpolation if enabled
+                if (enableStateInterpolation)
+                {
+                    ApplyStateInterpolation();
+                }
+                
+                // Swap buffers after all hemisphere passes
+                ComputeBuffer temp = latticeBufferRead;
+                latticeBufferRead = latticeBufferWrite;
+                latticeBufferWrite = temp;
+                
+                // Mark slices as dirty to update visualization
+                isSliceDirty = true;
+                isHistogramDirty = true;
+                
+                // Fire the event
+                OnLatticeChanged?.Invoke();
+            }
+        }
+        
+        // Extract current slice views for each hemisphere - only when needed
+        if (isSliceDirty)
+        {
+            ExtractSlices();
+            CombineSlices();
+            isSliceDirty = false;
+        }
+        
+        // Log performance stats if enabled
+        if (logPerformanceStats && frameCounter == 0)
+        {
+            LogPerformanceStats();
+        }
+    }
+    
+    private void LogPerformanceStats()
+    {
+        string stats = "Hexademic performance stats:\n";
+        for (int i = 0; i < 4; i++)
+        {
+            stats += $"Hemisphere {i}: {lastFrameTimes[i]:F2}ms\n";
+        }
+        UnityEngine.Debug.Log(stats);
+    }
+    
+    // Controls whether simulation should advance each frame
+    private bool ShouldRunSimulation()
+    {
+        return visionCS != null && interoCS != null && emotionCS != null && memoryCS != null;
+    }
+    
+    // New method to apply spatial filtering for smoothing lattice values
+    private void ApplySpatialFiltering()
+    {
+        // You could implement this via a compute shader, but here's a simplified reference
+        // This would perform a 3D convolution/blur within the 4D space
+        if (sliceExtractCS != null)
+        {
+            int kernel = sliceExtractCS.FindKernel("SpatialFilter");
+            sliceExtractCS.SetBuffer(kernel, "g_VoxelLatticeRead", latticeBufferWrite);
+            sliceExtractCS.SetBuffer(kernel, "g_VoxelLatticeWrite", latticeBufferRead);
+            sliceExtractCS.SetInt("filterRadius", spatialFilterRadius);
+            
+            // Dispatch with appropriate thread group count
+            sliceExtractCS.Dispatch(kernel, LATTICE_DIM / THREAD_GROUP_SIZE, LATTICE_DIM / THREAD_GROUP_SIZE, LATTICE_DIM / THREAD_GROUP_SIZE);
+        }
+    }
+    
+    // New method to apply state interpolation (temporal smoothing)
+    private void ApplyStateInterpolation()
+    {
+        if (sliceExtractCS != null)
+        {
+            int kernel = sliceExtractCS.FindKernel("StateInterpolation");
+            sliceExtractCS.SetBuffer(kernel, "g_VoxelLatticeRead", latticeBufferRead);
+            sliceExtractCS.SetBuffer(kernel, "g_VoxelLatticeWrite", latticeBufferWrite);
+            sliceExtractCS.SetFloat("smoothingFactor", stateSmoothingFactor);
+            
+            // Dispatch with appropriate thread group count
+            sliceExtractCS.Dispatch(kernel, LATTICE_DIM / THREAD_GROUP_SIZE, LATTICE_DIM / THREAD_GROUP_SIZE, LATTICE_DIM / THREAD_GROUP_SIZE);
+        }
+    }
+    
+    public void RunHemisphereDispatch(int hemisphereIndex, ComputeShader shader, string kernelName)
+    {
+        if (shader == null) return;
+        
+        int kernel = shader.FindKernel(kernelName);
+        
+        // Set input buffers
+        shader.SetBuffer(kernel, "g_VoxelLatticeRead", latticeBufferRead);
+        shader.SetBuffer(kernel, "g_VoxelLatticeWrite", latticeBufferWrite);
+        
+        // Set current slice indices
+        shader.SetInt("xSlice", xSlice);
+        shader.SetInt("ySlice", ySlice);
+        shader.SetInt("zSlice", zSlice);
+        shader.SetInt("wSlice", wSlice);
+        
+        // Set additional parameters needed by individual hemispheres
+        SetHemisphereSpecificParameters(hemisphereIndex, shader, kernel);
+        
+        // Measure performance
+        dispatchTimers[hemisphereIndex].Reset();
+        dispatchTimers[hemisphereIndex].Start();
+        
+        // Dispatch compute shader
+        shader.Dispatch(kernel, LATTICE_DIM / THREAD_GROUP_SIZE, LATTICE_DIM / THREAD_GROUP_SIZE, LATTICE_DIM / THREAD_GROUP_SIZE);
+        
+        // Record timing
+        dispatchTimers[hemisphereIndex].Stop();
+        lastFrameTimes[hemisphereIndex] = (float)dispatchTimers[hemisphereIndex].ElapsedTicks / Stopwatch.Frequency * 1000f;
+        
+        // Update historical data
+        historicalFrameTimes[hemisphereIndex].Dequeue();
+        historicalFrameTimes[hemisphereIndex].Enqueue(lastFrameTimes[hemisphereIndex]);
+    }
+    
+    // Set parameters specific to each hemisphere type
+    private void SetHemisphereSpecificParameters(int hemisphereIndex, ComputeShader shader, int kernel)
+    {
+        shader.SetInt("hemisphereIndex", hemisphereIndex);
+        shader.SetFloat("deltaTime", Time.deltaTime);
+        shader.SetFloat("timeSinceStartup", Time.time);
+        
+        // Add hemisphere-specific parameters based on type
+        switch(hemisphereIndex)
+        {
+            case 0: // Vision
+                // Vision-specific parameters
+                shader.SetFloat("visualAttention", hemisphereWeights[0]);
+                break;
+                
+            case 1: // Interoception
+                // Interoception-specific parameters
+                shader.SetFloat("sensoryIntensity", hemisphereWeights[1]);
+                break;
+                
+            case 2: // Emotion
+                // Emotion-specific parameters  
+                shader.SetFloat("emotionalValence", hemisphereWeights[2]);
+                break;
+                
+            case 3: // Memory
+                // Memory-specific parameters
+                shader.SetFloat("memoryRetention", hemisphereWeights[3]);
+                break;
+        }
+    }
+    
+    public void ExtractSlices()
+    {
+        if (sliceExtractCS == null) return;
+        
+        int kernel = sliceExtractCS.FindKernel("ExtractSlice");
+        sliceExtractCS.SetBuffer(kernel, "g_VoxelLatticeRead", latticeBufferRead);
+        sliceExtractCS.SetInt("sliceMode", (int)currentSliceMode);
+        sliceExtractCS.SetInt("xSlice", xSlice);
+        sliceExtractCS.SetInt("ySlice", ySlice);
+        sliceExtractCS.SetInt("zSlice", zSlice);
+        sliceExtractCS.SetInt("wSlice", wSlice);
+        
+        // Extract each hemisphere
+        for (int i = 0; i < 4; i++)
+        {
+            sliceExtractCS.SetInt("hemisphereIndex", i);
+            sliceExtractCS.SetTexture(kernel, "Result", hemisphereSlices[i]);
+            sliceExtractCS.Dispatch(kernel, Mathf.CeilToInt(LATTICE_DIM / 8f), Mathf.CeilToInt(LATTICE_DIM / 8f), 1);
+        }
+    }
+    
+    public void CombineSlices()
+    {
+        if (sliceExtractCS == null) return;
+        
+        int kernel = sliceExtractCS.FindKernel("CombineSlices");
+        
+        // Get colors based on current color scheme
+        Color[] colors = GetColorsForCurrentScheme();
+        
+        for (int i = 0; i < 4; i++)
+        {
+            sliceExtractCS.SetTexture(kernel, "HemisphereSlice" + i, hemisphereSlices[i]);
+            sliceExtractCS.SetFloat("HemisphereWeight" + i, hemisphereWeights[i]);
+            sliceExtractCS.SetVector("HemisphereColor" + i, colors[i]);
+        }
+        
+        // Additional parameters for advanced visualization
+        sliceExtractCS.SetInt("colorScheme", (int)colorScheme);
+        sliceExtractCS.SetFloat("contrastEnhancement", 1.2f); // Slightly boost contrast
+        
+        sliceExtractCS.SetTexture(kernel, "CombinedResult", combinedSlice);
+        sliceExtractCS.Dispatch(kernel, Mathf.CeilToInt(LATTICE_DIM / 8f), Mathf.CeilToInt(LATTICE_DIM / 8f), 1);
+    }
+    
+    // Select appropriate color scheme
+    private Color[] GetColorsForCurrentScheme()
+    {
+        switch (colorScheme)
+        {
+            case ColorScheme.Heatmap:
+                return new Color[] {
+                    new Color(0.0f, 0.0f, 1.0f), // Cold (blue)
+                    new Color(0.0f, 1.0f, 1.0f), // Cyan
+                    new Color(1.0f, 1.0f, 0.0f), // Yellow
+                    new Color(1.0f, 0.0f, 0.0f)  // Hot (red)
+                };
+                
+            case ColorScheme.Spectrum:
+                return new Color[] {
+                    new Color(1.0f, 0.0f, 1.0f), // Magenta
+                    new Color(0.0f, 0.0f, 1.0f), // Blue
+                    new Color(0.0f, 1.0f, 0.0f), // Green
+                    new Color(1.0f, 1.0f, 0.0f)  // Yellow
+                };
+                
+            case ColorScheme.Monochrome:
+                return new Color[] {
+                    new Color(0.2f, 0.2f, 0.2f), // Dark gray
+                    new Color(0.4f, 0.4f, 0.4f), // Medium gray
+                    new Color(0.7f, 0.7f, 0.7f), // Light gray
+                    new Color(1.0f, 1.0f, 1.0f)  // White
+                };
+                
+            case ColorScheme.Standard:
+            default:
+                return standardColors;
+        }
+    }
+    
+    // Probe a specific voxel and return all hemisphere values
+    public async Task<(int vision, int intero, int emotion, int memory)> ProbeVoxelAsync(int x, int y, int z, int w)
+    {
+        if (x < 0 || x >= LATTICE_DIM || y < 0 || y >= LATTICE_DIM || 
+            z < 0 || z >= LATTICE_DIM || w < 0 || w >= LATTICE_DIM)
+        {
+            return (0, 0, 0, 0); // Out of bounds
+        }
+        
+        int index = (((x * LATTICE_DIM + y) * LATTICE_DIM + z) * LATTICE_DIM + w);
+        
+        if (!useAsyncReadback)
+        {
+            return ProbeVoxel(x, y, z, w); // Fall back to synchronous method
+        }
+        
+        // Use more efficient async GPU readback
+        ComputeBuffer readbackBuffer = new ComputeBuffer(1, sizeof(ushort));
+        int kernel = sliceExtractCS.FindKernel("CopyVoxel");
+        sliceExtractCS.SetBuffer(kernel, "g_VoxelLatticeRead", latticeBufferRead);
+        sliceExtractCS.SetInt("voxelIndex", index);
+        sliceExtractCS.SetBuffer(kernel, "ReadbackBuffer", readbackBuffer);
+        sliceExtractCS.Dispatch(kernel, 1, 1, 1);
+        
+        // Create a Task for async readback
+        TaskCompletionSource<(int, int, int, int)> tcs = new TaskCompletionSource<(int, int, int, int)>();
+        
+        // Schedule readback
+        ushort[] data = new ushort[1];
+        
+        // Simulate async readback (in a real implementation, use AsyncGPUReadback)
+        await Task.Delay(1); // Just a placeholder for the concept
+        readbackBuffer.GetData(data);
+        readbackBuffer.Release();
+        
+        // Extract the 4-bit fields
+        return (
+            vision: data[0] & 0xF,
+            intero: (data[0] >> 4) & 0xF,
+            emotion: (data[0] >> 8) & 0xF,
+            memory: (data[0] >> 12) & 0xF
+        );
+    }
+    
+    // Synchronous probing (legacy/fallback)
+    public (int vision, int intero, int emotion, int memory) ProbeVoxel(int x, int y, int z, int w)
+    {
+        if (x < 0 || x >= LATTICE_DIM || y < 0 || y >= LATTICE_DIM || 
+            z < 0 || z >= LATTICE_DIM || w < 0 || w >= LATTICE_DIM)
+        {
+            return (0, 0, 0, 0); // Out of bounds
+        }
+        
+        // This requires a readback from GPU to CPU - use sparingly!
+        int index = (((x * LATTICE_DIM + y) * LATTICE_DIM + z) * LATTICE_DIM + w);
+        
+        // Create a temporary buffer for the readback
+        ComputeBuffer readbackBuffer = new ComputeBuffer(1, sizeof(ushort));
+        int kernel = sliceExtractCS.FindKernel("CopyVoxel");
+        sliceExtractCS.SetBuffer(kernel, "g_VoxelLatticeRead", latticeBufferRead);
+        sliceExtractCS.SetInt("voxelIndex", index);
+        sliceExtractCS.SetBuffer(kernel, "ReadbackBuffer", readbackBuffer);
+        sliceExtractCS.Dispatch(kernel, 1, 1, 1);
+        
+        // Read the data back
+        ushort[] data = new ushort[1];
+        readbackBuffer.GetData(data);
+        readbackBuffer.Release();
+        
+        // Extract the 4-bit fields
+        return (
+            vision: data[0] & 0xF,
+            intero: (data[0] >> 4) & 0xF,
+            emotion: (data[0] >> 8) & 0xF,
+            memory: (data[0] >> 12) & 0xF
+        );
+    }
+    
+    // Optimized batch probe - useful for examining regions
+    public async Task<(int vision, int intero, int emotion, int memory)[]> ProbeBatchAsync(List<(int x, int y, int z, int w)> coordinates)
+    {
+        if (coordinates == null || coordinates.Count == 0)
+            return new (int, int, int, int)[0];
+            
+        int count = coordinates.Count;
+        ComputeBuffer indexBuffer = new ComputeBuffer(count, sizeof(int));
+        ComputeBuffer resultBuffer = new ComputeBuffer(count, sizeof(ushort));
+        
+        // Convert coordinates to indices
+        int[] indices = new int[count];
+        for (int i = 0; i < count; i++)
+        {
+            var (x, y, z, w) = coordinates[i];
+            if (x >= 0 && x < LATTICE_DIM && y >= 0 && y < LATTICE_DIM &&
+                z >= 0 && z < LATTICE_DIM && w >= 0 && w < LATTICE_DIM)
+            {
+                indices[i] = (((x * LATTICE_DIM + y) * LATTICE_DIM + z) * LATTICE_DIM + w);
+            }
+            else
+            {
+                indices[i] = -1; // Mark invalid coordinates
+            }
+        }
+        
+        indexBuffer.SetData(indices);
+        
+        // Use compute shader to batch-copy the values
+        int kernel = sliceExtractCS.FindKernel("CopyVoxelBatch");
+        sliceExtractCS.SetBuffer(kernel, "g_VoxelLatticeRead", latticeBufferRead);
+        sliceExtractCS.SetBuffer(kernel, "IndexBuffer", indexBuffer);
+        sliceExtractCS.SetBuffer(kernel, "ResultBuffer", resultBuffer);
+        sliceExtractCS.SetInt("batchCount", count);
+        
+        // Adjust dispatch count based on batch size (64 threads per group)
+        int dispatchCount = Mathf.CeilToInt(count / 64f);
+        sliceExtractCS.Dispatch(kernel, dispatchCount, 1, 1);
+        
+        // Simulate async readback
+        await Task.Delay(1); // Just a placeholder
+        
+        // Read results
+        ushort[] results = new ushort[count];
+        resultBuffer.GetData(results);
+        
+        // Clean up
+        indexBuffer.Release();
+        resultBuffer.Release();
+        
+        // Process results
+        var output = new (int vision, int intero, int emotion, int memory)[count];
+        for (int i = 0; i < count; i++)
+        {
+            if (indices[i] >= 0)
+            {
+                output[i] = (
+                    vision: results[i] & 0xF,
+                    intero: (results[i] >> 4) & 0xF,
+                    emotion: (results[i] >> 8) & 0xF,
+                    memory: (results[i] >> 12) & 0xF
+                );
+            }
+            else
+            {
+                output[i] = (0, 0, 0, 0); // Invalid coordinate
+            }
+        }
+        
+        return output;
+    }
+    
+    // Stimulate/poke a specific voxel
+    public void PokeVoxel(int x, int y, int z, int w, int hemisphereIndex, int value)
+    {
+        if (x < 0 || x >= LATTICE_DIM || y < 0 || y >= LATTICE_DIM || 
+            z < 0 || z >= LATTICE_DIM || w < 0 || w >= LATTICE_DIM ||
+            hemisphereIndex < 0 || hemisphereIndex >= 4 || 
+            value < 0 || value > 15)
+        {
+            return; // Invalid parameters
+        }
+        
+        // Use compute shader for poking - more efficient than reading back entire buffer
+        int kernel = sliceExtractCS.FindKernel("PokeVoxel");
+        sliceExtractCS.SetBuffer(kernel, "g_VoxelLatticeRead", latticeBufferRead);
+        sliceExtractCS.SetBuffer(kernel, "g_VoxelLatticeWrite", latticeBufferRead); // Write back to read buffer to see immediate results
+        sliceExtractCS.SetInt("pokeX", x);
+        sliceExtractCS.SetInt("pokeY", y);
+        sliceExtractCS.SetInt("pokeZ", z);
+        sliceExtractCS.SetInt("pokeW", w);
+        sliceExtractCS.SetInt("pokeHemisphere", hemisphereIndex);
+        sliceExtractCS.SetInt("pokeValue", value);
+        sliceExtractCS.Dispatch(kernel, 1, 1, 1);
+        
+        // Mark as dirty for updates
+        isSliceDirty = true;
+        isHistogramDirty = true;
+        
+        // Fire the event
+        OnLatticeChanged?.Invoke();
+    }
+    
+    // Batch poke multiple voxels at once (much more efficient)
+        public void PokeBatch(List<(int x, int y, int z, int w, int hemisphere, int value)> pokeCommands)
+        {
+            if (pokeCommands == null || pokeCommands.Count == 0)
+                return;
+            
+            int count = pokeCommands.Count;
+            // Each entry: x,y,z,w,hemisphere,value
+            ComputeBuffer pokeBuffer = new ComputeBuffer(count, sizeof(int) * 6);
+            int[] pokeData = new int[count * 6];
+            
+            for (int i = 0; i < count; i++)
+            {
+                var cmd = pokeCommands[i];
+                pokeData[i * 6 + 0] = cmd.x;
+                pokeData[i * 6 + 1] = cmd.y;
+                pokeData[i * 6 + 2] = cmd.z;
+                pokeData[i * 6 + 3] = cmd.w;
+                pokeData[i * 6 + 4] = cmd.hemisphere;
+                pokeData[i * 6 + 5] = cmd.value;
+            }
+            
+            pokeBuffer.SetData(pokeData);
+            
+            int kernel = sliceExtractCS.FindKernel("PokeBatch");
+            sliceExtractCS.SetBuffer(kernel, "IndexBuffer", pokeBuffer);
+            sliceExtractCS.SetBuffer(kernel, "g_VoxelLatticeRead", latticeBufferRead);
+            sliceExtractCS.SetBuffer(kernel, "g_VoxelLatticeWrite", latticeBufferWrite);
+            sliceExtractCS.SetInt("batchCount", count);
+            
+            // 64 threads per group
+            int groups = Mathf.CeilToInt(count / 64f);
+            sliceExtractCS.Dispatch(kernel, groups, 1, 1);
+            
+            pokeBuffer.Release();
+            
+            isSliceDirty = true;
+            isHistogramDirty = true;
+            OnLatticeChanged?.Invoke();
+        }
+        
+        /// <summary>
+        /// Save the entire 4D lattice to a binary file.
+        /// </summary>
+        public void SaveLatticeState(string path)
+        {
+            // Read back from GPU
+            ushort[] data = new ushort[LATTICE_SIZE];
+            latticeBufferRead.GetData(data);
+            
+            using (var fs = new System.IO.FileStream(path, System.IO.FileMode.Create))
+            using (var bw = new System.IO.BinaryWriter(fs))
+            {
+                bw.Write(LATTICE_DIM);
+                for (int i = 0; i < data.Length; i++)
+                    bw.Write(data[i]);
+            }
+            
+            UnityEngine.Debug.Log($"Hexademic lattice saved to {path}");
+        }
+        
+        /// <summary>
+        /// Load a previously-saved lattice file.
+        /// </summary>
+        public void LoadLatticeState(string path)
+        {
+            if (!System.IO.File.Exists(path))
+            {
+                UnityEngine.Debug.LogError($"Cannot load lattice: file not found at {path}");
+                return;
+            }
+            
+            ushort[] data;
+            using (var fs = new System.IO.FileStream(path, System.IO.FileMode.Open))
+            using (var br = new System.IO.BinaryReader(fs))
+            {
+                int dim = br.ReadInt32();
+                if (dim != LATTICE_DIM)
+                {
+                    UnityEngine.Debug.LogError($"Lattice dimension mismatch: file is {dim}, expected {LATTICE_DIM}");
+                    return;
+                }
+                int total = LATTICE_SIZE;
+                data = new ushort[total];
+                for (int i = 0; i < total; i++)
+                    data[i] = br.ReadUInt16();
+            }
+            
+            latticeBufferRead.SetData(data);
+            latticeBufferWrite.SetData(data);
+            isSliceDirty = true;
+            isHistogramDirty = true;
+            OnLatticeChanged?.Invoke();
+            UnityEngine.Debug.Log($"Hexademic lattice loaded from {path}");
+        }
+        
+        /// <summary>
+        /// Release all compute buffers, native arrays, and render textures.
+        /// </summary>
+        private void CleanupResources()
+        {
+            if (latticeBufferRead != null) { latticeBufferRead.Release(); latticeBufferRead = null; }
+            if (latticeBufferWrite != null) { latticeBufferWrite.Release(); latticeBufferWrite = null; }
+            if (histogramBuffer != null)   { histogramBuffer.Release();   histogramBuffer = null; }
+            if (nativeLatticeData.IsCreated) nativeLatticeData.Dispose();
+            
+            for (int i = 0; i < hemisphereSlices.Length; i++)
+            {
+                if (hemisphereSlices[i] != null) { hemisphereSlices[i].Release(); hemisphereSlices[i] = null; }
+            }
+            if (combinedSlice != null) { combinedSlice.Release(); combinedSlice = null; }
+        }
+        
+        private void OnDestroy()
+        {
+            CleanupResources();
+        }
+    }
+}
