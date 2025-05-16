@@ -1,6 +1,7 @@
 # .github/workflows/ci.yml
 name: CI
 
+# Controls when the workflow will run
 on:
   push:
     branches: [ main ]
@@ -10,38 +11,55 @@ on:
 
 jobs:
   build:
-    name: Build & Upload
+    name: Build, Test & Upload
     runs-on: ubuntu-latest
 
     steps:
-      - name: 📦 Checkout repository
+      # 1️⃣ Check out the repo
+      - name: 📂 Checkout repository
         uses: actions/checkout@v4
 
-      - name: 🔧 Setup Node.js
+      # 2️⃣ Set up Node.js
+      - name: 🔧 Setup Node.js 18.x
         uses: actions/setup-node@v3
         with:
           node-version: '18'
 
+      # 3️⃣ Cache npm dependencies
+      - name: ⚡ Cache npm
+        uses: actions/cache@v3
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      # 4️⃣ Install dependencies
       - name: 📥 Install dependencies
         run: npm ci
 
-      - name: 🔨 Build for production
+      # 5️⃣ Run your test suite
+      - name: ✅ Run tests
+        run: npm test
+
+      # 6️⃣ Build for production
+      - name: 🛠 Build
         run: npm run build
 
-      - name: 📂 Verify build output
-        run: |
-          echo "Contents of build/:"
-          ls -R build
+      # 7️⃣ Inspect build folder (optional sanity check)
+      - name: 👀 List build output
+        run: ls -R build
 
-      - name: ☁️ Upload build artifact
+      # 8️⃣ Upload the build artifacts
+      - name: ☁️ Upload build directory
         uses: actions/upload-artifact@v3
         with:
-          name: hexademic-build
-          path: build/**
+          name: hexacademic-build
+          path: build/
 
-      # (Optional) if later steps or jobs need the artifact in the same workflow:
+      # 9️⃣ (Optional) download it back later in the same workflow
       - name: 📥 Download build artifact
         uses: actions/download-artifact@v3
         with:
-          name: hexademic-build
+          name: hexacademic-build
           path: downloaded-build/
