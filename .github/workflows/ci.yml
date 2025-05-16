@@ -1,15 +1,11 @@
 # .github/workflows/ci.yml
 name: CI
 
-# Controls when the workflow will run
 on:
-  # Trigger on push or pull_request to main
   push:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
-
-  # Manual trigger
   workflow_dispatch:
 
 jobs:
@@ -38,9 +34,9 @@ jobs:
       - name: Build for production
         run: npm run build
 
-      # optionally, upload build artifacts
+      # Optional: upload your build directory as an artifact
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v2
         with:
           name: hexademic-build
           path: build/
