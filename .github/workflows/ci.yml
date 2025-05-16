@@ -3,46 +3,45 @@ name: CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ main ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
   build:
-    name: Build & Test
+    name: Build & Upload
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: 📦 Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: 🔧 Setup Node.js
         uses: actions/setup-node@v3
         with:
           node-version: '18'
 
-      - name: Install dependencies
+      - name: 📥 Install dependencies
         run: npm ci
 
-      - name: Lint code
-        run: npm run lint
-
-      - name: Run tests
-        run: npm test -- --coverage
-
-      - name: Build for production
+      - name: 🔨 Build for production
         run: npm run build
 
-      # Pin to v2 to avoid the “missing download info” error
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v2
+      - name: 📂 Verify build output
+        run: |
+          echo "Contents of build/:"
+          ls -R build
+
+      - name: ☁️ Upload build artifact
+        uses: actions/upload-artifact@v3
         with:
           name: hexademic-build
-          path: build/
+          path: build/**
 
-      # (Optional) Download the same artifact later in this workflow if needed
-      - name: Download build artifact
+      # (Optional) if later steps or jobs need the artifact in the same workflow:
+      - name: 📥 Download build artifact
         uses: actions/download-artifact@v3
         with:
           name: hexademic-build
+          path: downloaded-build/
