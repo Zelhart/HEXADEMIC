@@ -1,0 +1,402 @@
+// EmotionalFieldCompute.compute - The compute shader implementation of the emotional field propagation
+
+#pragma kernel CS_PropagateEmotions
+#pragma kernel CS_UpdateResonance
+#pragma kernel CS_ApplyEmotionsToLattice
+
+// Constants
+#define LATTICE_DIM 16
+#define THREAD_GROUP_SIZE 8
+#define NUM_HEMISPHERES 4
+#define EMOTION_HEMISPHERE 2  // H2 is the emotion hemisphere
+
+// Dimensional structure of the lattice (x,y,z,w)
+struct LatticeVoxel {
+    uint hemispheres[NUM_HEMISPHERES];  // Each hemisphere holds a 4-bit value (0-15)
+};
+
+// Emotion archetype definition
+struct EmotionalArchetype {
+    float4 center;       // 4D center coordinate
+    float influence;     // Strength of influence
+    float4 color;        // Visualization color
+    float falloffStart;  // Distance where falloff begins
+    float falloffEnd;    // Distance where falloff ends
+};
+
+// Emotion region definition
+struct EmotionalRegion {
+    float4 min;                  // Minimum bounds (inclusive)
+    float4 max;                  // Maximum bounds (inclusive)
+    float diffusionMultiplier;   // How quickly emotions flow in this region
+    float resonanceMultiplier;   // How strongly emotions resonate
+    float emotionalBias;         // Bias toward certain emotions (-1 to 1)
+};
+
+// Input/Output buffers
+RWStructuredBuffer<LatticeVoxel> LatticeData;         // Read-only lattice data for CS_PropagateEmotions
+RWStructuredBuffer<float> EmotionPotentials;          // Current emotional potential at each voxel
+RWStructuredBuffer<float4> EmotionGradients;          // Direction and magnitude of emotional flow
+RWStructuredBuffer<float> EmotionResonance;           // Current resonance at each voxel
+RWStructuredBuffer<float> ResonanceHistory;           // Historical resonance (emotional memory)
+
+// For writing back to lattice
+RWStructuredBuffer<LatticeVoxel> LatticeDataRead;     // Read-only lattice data for CS_ApplyEmotionsToLattice
+RWStructuredBuffer<LatticeVoxel> LatticeDataWrite;    // Write-only lattice data
+
+// Archetype and region buffers
+StructuredBuffer<EmotionalArchetype> EmotionArchetypes;
+StructuredBuffer<EmotionalRegion> EmotionRegions;
+
+// Parameters
+float deltaTime;             // Time since last update
+float diffusionRate;         // Base rate of diffusion
+float decayRate;             // How quickly emotions fade
+float resonanceAmp;          // Resonance amplification factor
+float memoryInfluence;       // Influence of past emotional states
+
+// Dimensional weights
+float xWeight;   // Visual/Perceptual dimension weight
+float yWeight;   // Spatial dimension weight
+float zWeight;   // Temporal dimension weight
+float wWeight;   // Abstract/Conceptual dimension weight
+
+// Counts of archetypes and regions
+int archetypeCount;
+int regionCount;
+
+// Utility functions
+
+// Convert 4D coordinates to flat buffer index
+uint Get4DIndex(uint x, uint y, uint z, uint w) {
+    return (((x * LATTICE_DIM + y) * LATTICE_DIM + z) * LATTICE_DIM + w);
+}
+
+// Convert flat index to 4D coordinates
+void IndexTo4D(uint index, out uint x, out uint y, out uint z, out uint w) {
+    w = index % LATTICE_DIM;
+    index /= LATTICE_DIM;
+    
+    z = index % LATTICE_DIM;
+    index /= LATTICE_DIM;
+    
+    y = index % LATTICE_DIM;
+    x = index / LATTICE_DIM;
+}
+
+// Check if coordinates are valid within the lattice
+bool IsValid4D(int x, int y, int z, int w) {
+    return (x >= 0 && x < LATTICE_DIM &&
+            y >= 0 && y < LATTICE_DIM &&
+            z >= 0 && z < LATTICE_DIM &&
+            w >= 0 && w < LATTICE_DIM);
+}
+
+// Calculate 4D distance between points
+float Distance4D(float4 a, float4 b) {
+    // Weighted distance to account for different dimension importance
+    float4 diff = a - b;
+    diff.x *= xWeight;
+    diff.y *= yWeight;
+    diff.z *= zWeight;
+    diff.w *= wWeight;
+    
+    return length(diff);
+}
+
+// Calculate the influence of archetypes at a point
+float3 CalculateArchetypeInfluence(float4 position, out float totalInfluence) {
+    float3 influence = float3(0, 0, 0); // Influence value, direction, color contribution
+    totalInfluence = 0;
+    
+    for (int i = 0; i < archetypeCount; i++) {
+        EmotionalArchetype archetype = EmotionArchetypes[i];
+        
+        float dist = Distance4D(position, archetype.center);
+        
+        // Apply falloff curve
+        float normDist = saturate((dist - archetype.falloffStart) / 
+                                 (archetype.falloffEnd - archetype.falloffStart));
+        float falloff = 1.0 - normDist;
+        
+        if (falloff > 0) {
+            // Calculate influence strength and direction
+            float strength = archetype.influence * falloff * falloff;
+            totalInfluence += strength;
+            
+            // Direction toward archetype (weighted by dimensions)
+            float4 dir = archetype.center - position;
+            dir.x *= xWeight;
+            dir.y *= yWeight;
+            dir.z *= zWeight;
+            dir.w *= wWeight;
+            
+            if (length(dir) > 0.001) {
+                dir = normalize(dir);
+            }
+            
+            // Add to total influence (using first component to store strength)
+            influence.x += strength;
+            
+            // Blend direction vectors based on strength
+            float3 normalizedDir = float3(dir.x, dir.y, dir.z); // Only using 3 components for direction blend
+            influence.yzw += normalizedDir * strength;
+        }
+    }
+    
+    // Normalize direction if there's any influence
+    if (influence.x > 0.001) {
+        influence.yzw /= influence.x;
+    }
+    
+    return influence;
+}
+
+// Check if a position is within a special emotional region and get its properties
+void GetRegionProperties(float4 position, inout float diffusionMult, inout float resonanceMult, inout float emotBias) {
+    for (int i = 0; i < regionCount; i++) {
+        EmotionalRegion region = EmotionRegions[i];
+        
+        // Check if position is within region bounds
+        if (all(position >= region.min) && all(position <= region.max)) {
+            diffusionMult = region.diffusionMultiplier;
+            resonanceMult = region.resonanceMultiplier;
+            emotBias = region.emotionalBias;
+            return; // Only apply the first matching region
+        }
+    }
+    
+    // Default values if not in any region
+    diffusionMult = 1.0;
+    resonanceMult = 1.0;
+    emotBias = 0.0;
+}
+
+// Calculate resonance similarity between two emotional values
+float EmotionalSimilarity(float value1, float value2) {
+    // Similarity function with a soft threshold
+    float diff = abs(value1 - value2);
+    return exp(-diff * diff * 2.0); // Gaussian-like similarity
+}
+
+[numthreads(THREAD_GROUP_SIZE, THREAD_GROUP_SIZE, THREAD_GROUP_SIZE)]
+void CS_PropagateEmotions(uint3 id : SV_DispatchThreadID) {
+    // Ensure we're within bounds for x, y, z
+    if (id.x >= LATTICE_DIM || id.y >= LATTICE_DIM || id.z >= LATTICE_DIM)
+        return;
+    
+    // Process each w-coordinate
+    for (uint w = 0; w < LATTICE_DIM; w++) {
+        uint centerIndex = Get4DIndex(id.x, id.y, id.z, w);
+        float4 position = float4(id.x, id.y, id.z, w);
+        
+        // Get current emotional potential and resonance
+        float currentPotential = EmotionPotentials[centerIndex];
+        float currentResonance = EmotionResonance[centerIndex];
+        
+        // Get region properties
+        float diffusionMult, resonanceMult, emotBias;
+        GetRegionProperties(position, diffusionMult, resonanceMult, emotBias);
+        
+        // Calculate archetype influence
+        float totalInfluence;
+        float3 archetypeEffect = CalculateArchetypeInfluence(position, totalInfluence);
+        
+        // Calculate laplacian (diffusion term)
+        float laplacian = 0.0;
+        int neighborCount = 0;
+        
+        // 6-connected neighborhood in 4D (positive and negative directions along each axis)
+        int4 offsets[8] = {
+            int4(1, 0, 0, 0), int4(-1, 0, 0, 0),
+            int4(0, 1, 0, 0), int4(0, -1, 0, 0),
+            int4(0, 0, 1, 0), int4(0, 0, -1, 0),
+            int4(0, 0, 0, 1), int4(0, 0, 0, -1)
+        };
+        
+        // Apply dimensional weights to the diffusion term
+        float weights[8] = {
+            xWeight, xWeight,
+            yWeight, yWeight,
+            zWeight, zWeight,
+            wWeight, wWeight
+        };
+        
+        // Calculate weighted laplacian (diffusion term)
+        for (int i = 0; i < 8; i++) {
+            int4 neighborCoord = int4(id.x, id.y, id.z, w) + offsets[i];
+            
+            if (IsValid4D(neighborCoord.x, neighborCoord.y, neighborCoord.z, neighborCoord.w)) {
+                uint neighborIndex = Get4DIndex(neighborCoord.x, neighborCoord.y, 
+                                               neighborCoord.z, neighborCoord.w);
+                
+                float neighborPotential = EmotionPotentials[neighborIndex];
+                
+                // Weight by dimension importance
+                laplacian += (neighborPotential - currentPotential) * weights[i];
+                neighborCount++;
+            }
+        }
+        
+        // Normalize by number of valid neighbors
+        if (neighborCount > 0) {
+            laplacian /= neighborCount;
+        }
+        
+        // Calculate memory influence
+        float memory = ResonanceHistory[centerIndex];
+        
+        // Calculate new potential using the emotional field equation
+        float newPotential = currentPotential + deltaTime * (
+            // Diffusion term (with region modifier)
+            diffusionRate * diffusionMult * laplacian +
+            
+            // Resonance amplification
+            resonanceAmp * resonanceMult * currentResonance +
+            
+            // Archetype influence
+            archetypeEffect.x +
+            
+            // Memory term
+            memoryInfluence * memory +
+            
+            // Region bias
+            emotBias -
+            
+            // Decay term
+            decayRate * currentPotential
+        );
+        
+        // Clamp to valid range
+        newPotential = clamp(newPotential, 0.0, 1.0);
+        
+        // Calculate emotional gradient (direction of flow)
+        float4 gradient = float4(0, 0, 0, 0);
+        
+        // If there's archetype influence, blend it with local gradient
+        if (archetypeEffect.x > 0.001) {
+            gradient = float4(archetypeEffect.y, archetypeEffect.z, archetypeEffect.w, 0) * 0.7;
+        }
+        
+        // Add gradient from neighbor potentials
+        for (int i = 0; i < 8; i++) {
+            int4 neighborCoord = int4(id.x, id.y, id.z, w) + offsets[i];
+            
+            if (IsValid4D(neighborCoord.x, neighborCoord.y, neighborCoord.z, neighborCoord.w)) {
+                uint neighborIndex = Get4DIndex(neighborCoord.x, neighborCoord.y, 
+                                               neighborCoord.z, neighborCoord.w);
+                
+                float neighborPotential = EmotionPotentials[neighborIndex];
+                
+                // If neighbor has higher potential, add to gradient in that direction
+                if (neighborPotential > currentPotential) {
+                    float diff = neighborPotential - currentPotential;
+                    gradient += float4(offsets[i]) * diff * weights[i] * 0.3;
+                }
+            }
+        }
+        
+        // Normalize gradient if its magnitude is significant
+        if (length(gradient) > 0.001) {
+            gradient = normalize(gradient);
+        }
+        
+        // Write results back to buffers
+        EmotionPotentials[centerIndex] = newPotential;
+        EmotionGradients[centerIndex] = gradient;
+    }
+}
+
+[numthreads(THREAD_GROUP_SIZE, THREAD_GROUP_SIZE, THREAD_GROUP_SIZE)]
+void CS_UpdateResonance(uint3 id : SV_DispatchThreadID) {
+    // Ensure we're within bounds
+    if (id.x >= LATTICE_DIM || id.y >= LATTICE_DIM || id.z >= LATTICE_DIM)
+        return;
+    
+    // Process each w-coordinate
+    for (uint w = 0; w < LATTICE_DIM; w++) {
+        uint centerIndex = Get4DIndex(id.x, id.y, id.z, w);
+        float4 position = float4(id.x, id.y, id.z, w);
+        
+        // Get the emotion value from the lattice (H2 = emotion hemisphere)
+        uint hemisphereValue = LatticeData[centerIndex].hemispheres[EMOTION_HEMISPHERE];
+        float normalizedValue = hemisphereValue / 15.0; // Normalize to 0-1 range
+        
+        // Calculate resonance with local neighborhood
+        float totalResonance = 0.0;
+        int resonanceCount = 0;
+        
+        // Extended neighborhood for resonance (includes diagonals and further neighbors)
+        for (int dx = -2; dx <= 2; dx++) {
+            for (int dy = -2; dy <= 2; dy++) {
+                for (int dz = -2; dz <= 2; dz++) {
+                    for (int dw = -2; dw <= 2; dw++) {
+                        // Skip the center point
+                        if (dx == 0 && dy == 0 && dz == 0 && dw == 0)
+                            continue;
+                        
+                        int nx = id.x + dx;
+                        int ny = id.y + dy;
+                        int nz = id.z + dz;
+                        int nw = w + dw;
+                        
+                        if (IsValid4D(nx, ny, nz, nw)) {
+                            uint neighborIndex = Get4DIndex(nx, ny, nz, nw);
+                            uint neighborValue = LatticeData[neighborIndex].hemispheres[EMOTION_HEMISPHERE];
+                            float neighborNormalized = neighborValue / 15.0;
+                            
+                            // Calculate distance (4D)
+                            float dist = length(float4(dx * xWeight, dy * yWeight, dz * zWeight, dw * wWeight));
+                            
+                            // Calculate similarity and apply distance falloff
+                            float similarity = EmotionalSimilarity(normalizedValue, neighborNormalized);
+                            float resonance = similarity * exp(-dist * 0.5);
+                            
+                            totalResonance += resonance;
+                            resonanceCount++;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Calculate average resonance
+        float avgResonance = (resonanceCount > 0) ? totalResonance / resonanceCount : 0.0;
+        
+        // Update resonance buffer
+        EmotionResonance[centerIndex] = avgResonance;
+        
+        // Update resonance history (memory) with temporal smoothing
+        float oldMemory = ResonanceHistory[centerIndex];
+        float newMemory = lerp(oldMemory, avgResonance, memoryInfluence * deltaTime * 2.0);
+        ResonanceHistory[centerIndex] = newMemory;
+    }
+}
+
+[numthreads(THREAD_GROUP_SIZE, THREAD_GROUP_SIZE, THREAD_GROUP_SIZE)]
+void CS_ApplyEmotionsToLattice(uint3 id : SV_DispatchThreadID) {
+    // Ensure we're within bounds
+    if (id.x >= LATTICE_DIM || id.y >= LATTICE_DIM || id.z >= LATTICE_DIM)
+        return;
+    
+    // Process each w-coordinate
+    for (uint w = 0; w < LATTICE_DIM; w++) {
+        uint index = Get4DIndex(id.x, id.y, id.z, w);
+        
+        // Get emotional potential from the simulation
+        float potential = EmotionPotentials[index];
+        
+        // Convert to hemisphere value (0-15)
+        uint emotionValue = (uint)(potential * 15.0 + 0.5);
+        emotionValue = clamp(emotionValue, 0u, 15u);
+        
+        // Read existing lattice values
+        LatticeVoxel voxel = LatticeDataRead[index];
+        
+        // Update only the emotion hemisphere (H2)
+        voxel.hemispheres[EMOTION_HEMISPHERE] = emotionValue;
+        
+        // Write back to lattice
+        LatticeDataWrite[index] = voxel;
+    }
+}
